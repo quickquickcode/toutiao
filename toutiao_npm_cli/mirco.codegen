@@ -1,0 +1,20 @@
+import { test, expect } from '@playwright/test';
+
+test('test', async ({ page }) => {
+  await page.goto('https://mp.toutiao.com/profile_v4/index?is_new_connect=0&is_new_user=0');
+  await page.getByRole('link', { name: '微头条' }).click();
+  await page.locator('.byte-drawer-mask').click();
+  await page.locator('div').filter({ hasText: /^有什么新鲜事想告诉大家？$/ }).nth(1).click();
+  await page.getByRole('paragraph').click();
+  await page.locator('div').filter({ hasText: /^有什么新鲜事想告诉大家？$/ }).nth(1).fill('nihao\n\nasdn1');
+  await page.getByRole('button', { name: '图片' }).click();
+  await page.getByRole('button', { name: '本地上传 Choose File' }).locator('input[type="file"]').click();
+  await page.getByRole('button', { name: '本地上传 Choose File' }).locator('input[type="file"]').setInputFiles('Gemini_Generated_Image_618xlx618xlx618x.png');
+  await page.getByRole('button', { name: '确定' }).click();
+  await page.getByText('头条首发').click();
+  await page.getByText('nihaoasdn1').click();
+  await page.getByText('nihaoasdn1').fill('nihao\n\nasdn1\n\nasdasdaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\naaa\n\naaa\n\na');
+  await page.getByText('aaa').nth(1).click();
+  await page.getByText('nihaoasdn1asdasdaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa').press('ControlOrMeta+a');
+  await page.getByRole('button', { name: '发布' }).click();
+});
