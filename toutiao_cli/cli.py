@@ -185,6 +185,17 @@ def micro_publish(
         raise typer.Exit(1)
 
 
+@micro_group.command("debug-page")
+def micro_debug_page():
+    """打开微头条发布页，输出 Playwright 看到的发布按钮诊断信息。"""
+    auth = TouTiaoAuth()
+    publisher = TouTiaoPublisher(auth)
+    result = publisher.debug_micro_page()
+    typer.echo(result)
+    if not result.get("ok") or not result.get("hasPublishText"):
+        raise typer.Exit(1)
+
+
 # ==================== 主入口 ====================
 
 @app.command()

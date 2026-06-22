@@ -4,18 +4,22 @@
 
 import logging
 import os
+from pathlib import Path
+import json
 from typing import Optional, List
 
 from playwright.sync_api import sync_playwright
 
 from .auth import TouTiaoAuth
-from .config import TOUTIAO_URLS
+from .config import (
+    CHROME_PATH,
+    TOUTIAO_URLS,
+    get_browser_storage_path,
+    get_storage_state_path,
+    get_user_data_dir,
+)
 
 logger = logging.getLogger(__name__)
-
-# 系统 Chrome 路径
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-
 
 class TouTiaoPublisher:
     """今日头条内容发布器"""
@@ -35,28 +39,27 @@ class TouTiaoPublisher:
     def _get_browser_context(self):
         """获取 Playwright 浏览器上下文"""
         pw = sync_playwright().start()
-
+        user_data_dir = get_user_data_dir()
+        Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+        launch_kwargs = {
+            "headless": False,
+            "viewport": {"width": 1440, "height": 900},
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
         if self.use_chrome and os.path.exists(CHROME_PATH):
-            # 使用系统安装的 Google Chrome
-            logger.info(f"使用系统 Chrome: {CHROME_PATH}")
-            # 注意：如果要复用 Chrome 已登录状态，可以添加 user_data_dir 参数
-            # 但这需要关闭正在运行的 Chrome
-            browser = pw.chromium.launch(
-                headless=False,
-                executable_path=CHROME_PATH,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                ]
-            )
+            logger.info(f"使用系统 Chrome 持久化 Profile: {CHROME_PATH}")
+            launch_kwargs["executable_path"] = CHROME_PATH
         else:
-            # 使用 Playwright 内置 Chromium
-            logger.info("使用 Playwright 内置 Chromium")
-            browser = pw.chromium.launch(headless=False)
-
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080}
+            logger.info("使用 Playwright Chromium 持久化 Profile")
+        context = pw.chromium.launch_persistent_context(
+            user_data_dir,
+            **launch_kwargs,
         )
-        return pw, browser, context
+        self._hydrate_context_storage(context)
+        self._install_storage_init_script(context)
+        return pw, context, context
 
     def _close_browser(self, pw, browser):
         """关闭浏览器"""
@@ -64,6 +67,20 @@ class TouTiaoPublisher:
             browser.close()
         finally:
             pw.stop()
+
+    def _hydrate_context_storage(self, context) -> None:
+        """补齐旧 Cookie 文件和 storage_state 的登录态。"""
+        storage_state_path = Path(get_storage_state_path())
+        if storage_state_path.exists():
+            try:
+                data = json.loads(storage_state_path.read_text(encoding="utf-8"))
+                cookies = data.get("cookies", [])
+                if cookies:
+                    context.add_cookies(cookies)
+                    logger.info(f"已从 storage_state 转移 {len(cookies)} 个 Cookie")
+            except Exception as exc:
+                logger.warning(f"加载 storage_state 失败: {exc}")
+        self._transfer_cookies(context)
 
     def _transfer_cookies(self, context):
         """转移 Cookie 到浏览器上下文"""
@@ -79,6 +96,117 @@ class TouTiaoPublisher:
         if cookies:
             context.add_cookies(cookies)
             logger.info(f"已转移 {len(cookies)} 个 Cookie")
+
+    def _restore_page_storage(self, page) -> None:
+        """把登录时保存的 localStorage/sessionStorage 写回页面。"""
+        storage_path = Path(get_browser_storage_path())
+        if not storage_path.exists():
+            return
+        try:
+            data = json.loads(storage_path.read_text(encoding="utf-8"))
+            page.evaluate(
+                """(data) => {
+                    for (const [key, value] of Object.entries(data.localStorage || {})) {
+                        window.localStorage.setItem(key, String(value));
+                    }
+                    for (const [key, value] of Object.entries(data.sessionStorage || {})) {
+                        window.sessionStorage.setItem(key, String(value));
+                    }
+                }""",
+                data,
+            )
+            logger.info("已恢复 localStorage/sessionStorage")
+        except Exception as exc:
+            logger.warning(f"恢复浏览器 Storage 失败: {exc}")
+
+    def _saved_storage_payload(self) -> dict:
+        """读取保存的浏览器 Storage，兼容旧文件与 Playwright storage_state。"""
+        storage_path = Path(get_browser_storage_path())
+        if storage_path.exists():
+            try:
+                return json.loads(storage_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.warning(f"读取浏览器 Storage 失败: {exc}")
+
+        state_path = Path(get_storage_state_path())
+        if not state_path.exists():
+            return {}
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            local_storage = {}
+            for origin in state.get("origins", []):
+                if "toutiao.com" not in origin.get("origin", ""):
+                    continue
+                for item in origin.get("localStorage", []):
+                    if item.get("name"):
+                        local_storage[item["name"]] = item.get("value", "")
+            return {"localStorage": local_storage, "sessionStorage": {}}
+        except Exception as exc:
+            logger.warning(f"读取 storage_state 失败: {exc}")
+            return {}
+
+    def _install_storage_init_script(self, context) -> None:
+        """在头条页面脚本运行前恢复 Storage，避免页面渲染成降级状态。"""
+        data = self._saved_storage_payload()
+        if not data:
+            return
+        payload = json.dumps(data, ensure_ascii=False)
+        script = """(() => {
+                const data = __PAYLOAD__;
+                if (!location.hostname.includes('toutiao.com')) return;
+                for (const [key, value] of Object.entries(data.localStorage || {})) {
+                    window.localStorage.setItem(key, String(value));
+                }
+                for (const [key, value] of Object.entries(data.sessionStorage || {})) {
+                    window.sessionStorage.setItem(key, String(value));
+                }
+            })()""".replace("__PAYLOAD__", payload)
+        context.add_init_script(script)
+        logger.info("已安装头条 Storage 预注入脚本")
+
+    def _prepare_publish_page(self, page) -> dict:
+        """滚动到底部并确认底部发布栏状态。"""
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(1800)
+        self._restore_page_storage(page)
+        page.evaluate(
+            """() => {
+                const masks = document.querySelectorAll('.byte-drawer-mask');
+                for (const mask of masks) {
+                    mask.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                }
+                window.scrollTo(0, document.documentElement.scrollHeight || document.body.scrollHeight);
+            }"""
+        )
+        page.wait_for_timeout(600)
+        return page.evaluate(
+            """() => {
+                const items = Array.from(document.querySelectorAll('button, span, div'))
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                            tag: el.tagName,
+                            text: (el.textContent || '').trim(),
+                            className: String(el.className || ''),
+                            visible: rect.width > 0 && rect.height > 0,
+                            fixed: getComputedStyle(el).position === 'fixed',
+                            rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                        };
+                    })
+                    .filter((item) => item.visible && item.text && item.text.length <= 20);
+                const publishLike = items.filter((item) => item.text === '发布' || item.text === '存草稿');
+                return {
+                    url: location.href,
+                    innerWidth,
+                    innerHeight,
+                    scrollY,
+                    scrollHeight: document.documentElement.scrollHeight,
+                    publishLike,
+                    hasPublishText: document.body.innerText.includes('发布'),
+                    hasDraftText: document.body.innerText.includes('存草稿'),
+                };
+            }"""
+        )
 
     def publish_article(
         self,
@@ -101,14 +229,12 @@ class TouTiaoPublisher:
         pw, browser, context = self._get_browser_context()
 
         try:
-            # 转移 Cookie
-            self._transfer_cookies(context)
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
 
             # 打开发布页面
             logger.info("正在打开发布页面...")
             page.goto(TOUTIAO_URLS['article_publish'], timeout=60000)
-            page.wait_for_load_state("domcontentloaded")
+            self._prepare_publish_page(page)
 
             # 检查是否需要登录
             if 'login' in page.url or 'auth' in page.url:
@@ -171,14 +297,13 @@ class TouTiaoPublisher:
         pw, browser, context = self._get_browser_context()
 
         try:
-            # 转移 Cookie
-            self._transfer_cookies(context)
-            page = context.new_page()
+            page = context.pages[0] if context.pages else context.new_page()
 
             # 打开微头条页面
             logger.info("正在打开微头条发布页面...")
             page.goto(TOUTIAO_URLS['micro_publish'], timeout=60000)
-            page.wait_for_load_state("domcontentloaded")
+            page_state = self._prepare_publish_page(page)
+            logger.info(f"微头条页面状态: {page_state}")
 
             # 检查是否需要登录
             if 'login' in page.url or 'auth' in page.url:
@@ -231,6 +356,9 @@ class TouTiaoPublisher:
                             break
 
             logger.info("内容已填充，请在浏览器中手动检查并点击发布按钮")
+            page_state = self._prepare_publish_page(page)
+            if not page_state.get("hasPublishText"):
+                logger.warning(f"页面未检测到发布入口，请检查账号状态或页面版本: {page_state}")
             logger.info("按 Ctrl+C 终止程序")
 
             # 等待 5 分钟（用户手动发布）
@@ -241,5 +369,25 @@ class TouTiaoPublisher:
         except Exception as e:
             logger.error(f"发布异常: {e}")
             return {'success': False, 'message': str(e)}
+        finally:
+            self._close_browser(pw, browser)
+
+    def debug_micro_page(self) -> dict:
+        """打开微头条页并返回页面/按钮诊断信息。"""
+        pw, browser, context = self._get_browser_context()
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(TOUTIAO_URLS["micro_publish"], timeout=60000)
+            if "login" in page.url or "auth" in page.url:
+                return {"ok": False, "message": "需要登录", "url": page.url}
+            page_state = self._prepare_publish_page(page)
+            screenshot_path = Path(get_browser_storage_path()).with_name("toutiao_micro_debug.png")
+            try:
+                page.screenshot(path=str(screenshot_path), full_page=False)
+                page_state["screenshot_path"] = str(screenshot_path)
+            except Exception as exc:
+                page_state["screenshot_error"] = str(exc)
+            page.wait_for_timeout(5000)
+            return {"ok": True, **page_state}
         finally:
             self._close_browser(pw, browser)

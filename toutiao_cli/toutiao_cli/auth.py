@@ -10,7 +10,15 @@ from typing import Optional
 import requests
 from playwright.sync_api import sync_playwright
 
-from .config import TOUTIAO_URLS, DEFAULT_HEADERS, get_cookies_path
+from .config import (
+    TOUTIAO_URLS,
+    DEFAULT_HEADERS,
+    CHROME_PATH,
+    get_browser_storage_path,
+    get_cookies_path,
+    get_storage_state_path,
+    get_user_data_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +34,18 @@ class TouTiaoAuth:
     def _get_cookies_path(self) -> str:
         return get_cookies_path()
 
+    def _get_storage_state_path(self) -> str:
+        return get_storage_state_path()
+
+    def _get_browser_storage_path(self) -> str:
+        return get_browser_storage_path()
+
+    def _get_user_data_dir(self) -> str:
+        return get_user_data_dir()
+
     def _load_cookies(self) -> None:
         """从文件加载 Cookie"""
+        loaded = False
         try:
             path = self._get_cookies_path()
             if Path(path).exists():
@@ -39,9 +57,29 @@ class TouTiaoAuth:
                         cookie['value'],
                         domain=cookie.get('domain', '.toutiao.com')
                     )
+                loaded = True
                 logger.info(f"已加载 {len(data.get('cookies', []))} 个 Cookie")
         except Exception as e:
             logger.warning(f"加载 Cookie 失败: {e}")
+
+        if loaded:
+            return
+
+        try:
+            path = self._get_storage_state_path()
+            if Path(path).exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cookies = data.get("cookies", [])
+                for cookie in cookies:
+                    self.session.cookies.set(
+                        cookie["name"],
+                        cookie["value"],
+                        domain=cookie.get("domain", ".toutiao.com"),
+                    )
+                logger.info(f"已从 storage_state 加载 {len(cookies)} 个 Cookie")
+        except Exception as e:
+            logger.warning(f"加载 storage_state Cookie 失败: {e}")
 
     def _save_cookies(self, cookies: list) -> None:
         """保存 Cookie 到文件"""
@@ -58,6 +96,23 @@ class TouTiaoAuth:
         except Exception as e:
             logger.error(f"保存 Cookie 失败: {e}")
 
+    def _save_browser_storage(self, page) -> None:
+        """保存 localStorage/sessionStorage，兼容旧发布逻辑。"""
+        try:
+            path = Path(self._get_browser_storage_path())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = page.evaluate(
+                """() => ({
+                    localStorage: Object.assign({}, window.localStorage),
+                    sessionStorage: Object.assign({}, window.sessionStorage)
+                })"""
+            )
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info(f"已保存浏览器 Storage: {path}")
+        except Exception as e:
+            logger.warning(f"保存浏览器 Storage 失败: {e}")
+
     def login(self) -> bool:
         """
         扫码登录（使用 Playwright）
@@ -65,8 +120,19 @@ class TouTiaoAuth:
         """
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=False)
-                context = browser.new_context()
+                user_data_dir = self._get_user_data_dir()
+                Path(user_data_dir).mkdir(parents=True, exist_ok=True)
+                launch_kwargs = {
+                    "headless": False,
+                    "viewport": {"width": 1440, "height": 900},
+                    "args": ["--disable-blink-features=AutomationControlled"],
+                }
+                if Path(CHROME_PATH).exists():
+                    launch_kwargs["executable_path"] = CHROME_PATH
+                context = pw.chromium.launch_persistent_context(
+                    user_data_dir,
+                    **launch_kwargs,
+                )
                 page = context.new_page()
 
                 logger.info("正在打开登录页面...")
@@ -87,12 +153,17 @@ class TouTiaoAuth:
                     )
                 except Exception:
                     logger.error("登录超时")
-                    browser.close()
+                    context.close()
                     return False
 
                 # 保存 Cookie
                 cookies = context.cookies()
                 self._save_cookies(cookies)
+                storage_state_path = Path(self._get_storage_state_path())
+                storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+                context.storage_state(path=str(storage_state_path))
+                logger.info(f"已保存 Playwright storage_state: {storage_state_path}")
+                self._save_browser_storage(page)
 
                 # 更新 session
                 for cookie in cookies:
@@ -103,7 +174,7 @@ class TouTiaoAuth:
                     )
 
                 logger.info("登录成功！")
-                browser.close()
+                context.close()
                 return True
 
         except Exception as e:
