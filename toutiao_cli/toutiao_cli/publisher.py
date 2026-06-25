@@ -39,23 +39,49 @@ class TouTiaoPublisher:
     def _get_browser_context(self):
         """获取 Playwright 浏览器上下文"""
         pw = sync_playwright().start()
+
+        if self.use_chrome and os.path.exists(CHROME_PATH):
+            logger.info(f"使用系统 Chrome: {CHROME_PATH}")
+            browser = pw.chromium.launch(
+                headless=False,
+                executable_path=CHROME_PATH,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            self._hydrate_context_storage(context)
+            self._install_storage_init_script(context)
+            return pw, browser, context
+
+        logger.info("使用 Playwright Chromium 持久化 Profile")
         user_data_dir = get_user_data_dir()
         Path(user_data_dir).mkdir(parents=True, exist_ok=True)
-        launch_kwargs = {
-            "headless": False,
-            "viewport": {"width": 1440, "height": 900},
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        if self.use_chrome and os.path.exists(CHROME_PATH):
-            logger.info(f"使用系统 Chrome 持久化 Profile: {CHROME_PATH}")
-            launch_kwargs["executable_path"] = CHROME_PATH
-        else:
-            logger.info("使用 Playwright Chromium 持久化 Profile")
         context = pw.chromium.launch_persistent_context(
             user_data_dir,
-            **launch_kwargs,
+            headless=False,
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-accelerated-2d-canvas",
+                "--disable-gpu",
+            ],
         )
         self._hydrate_context_storage(context)
         self._install_storage_init_script(context)
@@ -166,35 +192,68 @@ class TouTiaoPublisher:
 
     def _prepare_publish_page(self, page) -> dict:
         """滚动到底部并确认底部发布栏状态。"""
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(1800)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(2500)
         self._restore_page_storage(page)
+
+        # 尝试关闭可能遮挡发布按钮的弹窗/抽屉
         page.evaluate(
             """() => {
-                const masks = document.querySelectorAll('.byte-drawer-mask');
-                for (const mask of masks) {
-                    mask.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                }
+                const selectors = [
+                    '.byte-drawer-mask',
+                    '.byte-modal-mask',
+                    '.tt-login-guide__mask',
+                    '.guide-popup-mask',
+                    '[class*="mask"]',
+                ];
+                selectors.forEach((sel) => {
+                    document.querySelectorAll(sel).forEach((el) => {
+                        try { el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch {}
+                    });
+                });
                 window.scrollTo(0, document.documentElement.scrollHeight || document.body.scrollHeight);
             }"""
         )
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(1000)
+
+        # 如果发布按钮固定在底部但不在视口，尝试滚动让它可见
+        page.evaluate(
+            """() => {
+                const all = Array.from(document.querySelectorAll('button, span, div, a'));
+                const publish = all.find((el) => (el.textContent || '').trim() === '发布');
+                if (publish) {
+                    const rect = publish.getBoundingClientRect();
+                    if (rect.top > window.innerHeight || rect.bottom < 0) {
+                        publish.scrollIntoView({ block: 'center', behavior: 'instant' });
+                    }
+                }
+            }"""
+        )
+        page.wait_for_timeout(500)
+
         return page.evaluate(
             """() => {
-                const items = Array.from(document.querySelectorAll('button, span, div'))
+                const all = Array.from(document.querySelectorAll('button, span, div, a'));
+                const items = all
                     .map((el) => {
                         const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
                         return {
                             tag: el.tagName,
                             text: (el.textContent || '').trim(),
                             className: String(el.className || ''),
-                            visible: rect.width > 0 && rect.height > 0,
-                            fixed: getComputedStyle(el).position === 'fixed',
+                            visible: rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden',
+                            fixed: style.position === 'fixed',
+                            disabled: el.disabled,
                             rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
                         };
                     })
                     .filter((item) => item.visible && item.text && item.text.length <= 20);
                 const publishLike = items.filter((item) => item.text === '发布' || item.text === '存草稿');
+                const publishBtn = all.find((el) => (el.textContent || '').trim() === '发布');
                 return {
                     url: location.href,
                     innerWidth,
@@ -204,6 +263,8 @@ class TouTiaoPublisher:
                     publishLike,
                     hasPublishText: document.body.innerText.includes('发布'),
                     hasDraftText: document.body.innerText.includes('存草稿'),
+                    publishBtnExists: !!publishBtn,
+                    publishBtnRect: publishBtn ? publishBtn.getBoundingClientRect() : null,
                 };
             }"""
         )
